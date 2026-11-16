@@ -9,6 +9,10 @@ import {
   UserMinus,
   Mail,
   CheckCircle,
+  Building2,
+  FilePlus,
+  FileText,
+  FileX,
   type LucideIcon,
 } from 'lucide-react';
 import { ActivityType } from '@/lib/db/schema';
@@ -25,6 +29,10 @@ const iconMap: Record<ActivityType, LucideIcon> = {
   [ActivityType.REMOVE_TEAM_MEMBER]: UserMinus,
   [ActivityType.INVITE_TEAM_MEMBER]: Mail,
   [ActivityType.ACCEPT_INVITATION]: CheckCircle,
+  [ActivityType.CREATE_EMPRESA]: Building2,
+  [ActivityType.CREATE_SERIE]: FilePlus,
+  [ActivityType.UPDATE_SERIE]: FileText,
+  [ActivityType.DELETE_SERIE]: FileX,
 };
 
 function getRelativeTime(date: Date) {
@@ -63,6 +71,14 @@ function formatAction(action: ActivityType): string {
       return 'You invited a team member';
     case ActivityType.ACCEPT_INVITATION:
       return 'You accepted an invitation';
+    case ActivityType.CREATE_EMPRESA:
+      return 'You registered a new company';
+    case ActivityType.CREATE_SERIE:
+      return 'You created an invoice series';
+    case ActivityType.UPDATE_SERIE:
+      return 'You updated an invoice series';
+    case ActivityType.DELETE_SERIE:
+      return 'You deleted an invoice series';
     default:
       return 'Unknown action occurred';
   }

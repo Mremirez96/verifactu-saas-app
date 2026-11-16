@@ -8,6 +8,27 @@
       "when": 1726443359662,
       "tag": "0000_soft_the_anarchist",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1794786795567,
+      "tag": "0001_verifactu_modelo",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1794786796320,
+      "tag": "0002_verifactu_guardas",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1794786797022,
+      "tag": "0003_verifactu_privilegios",
+      "breakpoints": true
     }
   ]
 }
