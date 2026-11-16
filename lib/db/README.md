@@ -24,6 +24,8 @@ del permiso mismo para lo que los triggers prohíben.
 | `facturas`, `facturas_lineas`, `facturas_desglose`, `facturas_relacionadas` | leer, insertar, actualizar, borrar (el ciclo de vida lo gobiernan los triggers) |
 | `registros_verifactu`, `eventos_log` | **solo** leer e insertar |
 | `envios_aeat` | leer; actualizar solo las columnas de estado del envío |
+| `aeat_lotes` | leer e insertar; actualizar **solo** las columnas de resultado, y solo mientras el lote está `EN_CURSO` |
+| `aeat_control_flujo` | leer y actualizar (la fila la crea un trigger al dar de alta la empresa) |
 | `cadenas_fiscales` | **solo** leer; el cerrojo se toma con `vf_bloquear_cadena()` |
 
 `TRUNCATE`, `REFERENCES`, `TRIGGER` y la creación de objetos no se conceden en

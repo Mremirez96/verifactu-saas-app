@@ -1,5 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import { db, type Transaction } from '@/lib/db/drizzle';
-import type { Empresa, Factura, RegistroVerifactu } from '@/lib/db/schema';
+import {
+  ActivityType,
+  type Empresa,
+  type Factura,
+  type FacturaDesglose,
+  type FacturaRelacionada,
+  type RegistroVerifactu,
+} from '@/lib/db/schema';
+import { registrarActividad } from '../actividad';
+import { serializarRegistroAlta, serializarRegistroAnulacion } from '../aeat/registro-xml';
 import type { ContextoUsuario } from '../contexto';
 import {
   contenidoQr,
@@ -7,6 +17,7 @@ import {
   fechaEnHuso,
   fechaHoraHuso,
   huellaRegistroAlta,
+  huellaRegistroAnulacion,
   TIPO_HUELLA_SHA256,
   verificarCadena,
   type ContenidoQr,
@@ -15,22 +26,53 @@ import {
 import { leerCadenas } from '../empresas/repositorio';
 import { cargarEmpresa } from '../empresas/servicio';
 import { comoErrorPostgres, ErrorDominio, traducirErrorBd } from '../errores';
-import { entornoAeat, SISTEMA_INFORMATICO } from '../sif';
+import { CARACTERISTICAS_SIF, datosProductor, entornoAeat, SISTEMA_INFORMATICO } from '../sif';
 import { uuid, validar } from '../validacion';
 import {
   bloquearCadena,
   buscarFacturaParaEmitir,
   buscarRegistro,
+  estadosEnvioDeAltas,
   horaServidor,
   insertarRegistro,
+  leerDesglose,
+  leerRelacionadas,
   listarCadena,
+  marcarAnulada,
   marcarEmitida,
   type CabeceraCadena,
 } from './repositorio';
 
 /* -------------------------------------------------------------------------- */
-/*  Contrato con el generador de XML (siguiente fase)                         */
+/*  Contrato con el generador de XML (lib/verifactu/aeat/registro-xml.ts)     */
 /* -------------------------------------------------------------------------- */
+
+/** Bloque «Encadenamiento»: primer registro o referencia al eslabón previo. */
+export type DatosEncadenamiento =
+  | { esPrimerRegistro: true; registroAnterior: null }
+  | {
+      esPrimerRegistro: false;
+      /** Bloque «RegistroAnterior»: identifica el eslabón previo. */
+      registroAnterior: {
+        idEmisorFactura: string;
+        numSerieFactura: string;
+        fechaExpedicion: string;
+        huella: string;
+      };
+    };
+
+/** Bloque «SistemaInformatico»: productor, sistema e instalación. */
+export type DatosSistemaInformatico = typeof SISTEMA_INFORMATICO & {
+  numeroInstalacion: string;
+  /** Productor del software; `null` si falta configurarlo (el generador real lo exige). */
+  productor: { nombreRazon: string | null; nif: string | null };
+  /** «TipoUsoPosibleSoloVerifactu». */
+  soloVerifactu: boolean;
+  /** «TipoUsoPosibleMultiOT». */
+  multiObligado: boolean;
+  /** «IndicadorMultiplesOT»: da servicio a más de un obligado en este momento. */
+  multiplesObligadosAhora: boolean;
+};
 
 /**
  * Todo lo que el generador de XML necesita para escribir el «RegistroAlta».
@@ -38,40 +80,84 @@ import {
  * reproducirlos tal cual, sin volver a dar formato a nada.
  */
 export type DatosRegistroAlta = {
+  /** Identificador del registro; viaja como «RefExterna». */
+  registroId: string;
   empresa: Pick<Empresa, 'id' | 'nif' | 'nombreRazon' | 'modoVerifactu'>;
   factura: Factura;
-  encadenamiento:
-    | { esPrimerRegistro: true; registroAnterior: null }
-    | {
-        esPrimerRegistro: false;
-        /** Bloque «RegistroAnterior»: identifica el eslabón previo. */
-        registroAnterior: {
-          idEmisorFactura: string;
-          numSerieFactura: string;
-          fechaExpedicion: string;
-          huella: string;
-        };
-      };
-  sistemaInformatico: typeof SISTEMA_INFORMATICO & { numeroInstalacion: string };
+  /** Bloque «Desglose», tal como quedó congelado con la factura. */
+  desglose: FacturaDesglose[];
+  /** «FacturasRectificadas» y «FacturasSustituidas». */
+  relacionadas: FacturaRelacionada[];
+  esSubsanacion: boolean;
+  /** «RechazoPrevio» (lista L17). */
+  rechazoPrevio: 'N' | 'S' | 'X';
+  encadenamiento: DatosEncadenamiento;
+  sistemaInformatico: DatosSistemaInformatico;
   fechaHoraHusoGen: string;
   tipoHuella: typeof TIPO_HUELLA_SHA256;
   huella: string;
   qrUrl: string;
 };
 
+/** Todo lo que el generador de XML necesita para escribir el «RegistroAnulacion». */
+export type DatosRegistroAnulacion = {
+  registroId: string;
+  empresa: Pick<Empresa, 'id' | 'nif' | 'nombreRazon' | 'modoVerifactu'>;
+  idEmisorFactura: string;
+  numSerieFactura: string;
+  fechaExpedicion: string;
+  /** «SinRegistroPrevio»: el alta de esta factura no consta en la AEAT. */
+  sinRegistroPrevio: boolean;
+  /** «RechazoPrevio»: nueva anulación tras el rechazo de la anterior. */
+  rechazoPrevio: boolean;
+  encadenamiento: DatosEncadenamiento;
+  sistemaInformatico: DatosSistemaInformatico;
+  fechaHoraHusoGen: string;
+  tipoHuella: typeof TIPO_HUELLA_SHA256;
+  huella: string;
+};
+
 /**
  * El registro se guarda en una tabla de SOLO INSERCIÓN: lo que se escriba hoy
- * en `xml_registro` no se podrá corregir nunca. Por eso el generador de XML
- * no tiene valor por defecto ni sustituto provisional: quien llama a
- * `emitirFactura` tiene que aportarlo, y hasta que exista el generador real
- * (validado contra los XSD de la AEAT) la emisión no se expone en ninguna
- * acción ni ruta.
+ * en `xml_registro` no se podrá corregir nunca. Por defecto se usa el
+ * generador real (aeat/registro-xml.ts), cuya salida se valida en los tests
+ * contra el XSD oficial de la AEAT. Los serializadores siguen siendo
+ * inyectables para poder probar el motor de encadenamiento de forma aislada.
  */
 export type DependenciasEmision = {
-  serializarRegistroAlta: (datos: DatosRegistroAlta) => string;
+  serializarRegistroAlta?: (datos: DatosRegistroAlta) => string;
+  serializarRegistroAnulacion?: (datos: DatosRegistroAnulacion) => string;
   /** Espera máxima por el cerrojo de la cadena. Por defecto, 10 s. */
   esperaCerrojoMs?: number;
 };
+
+/** «SistemaInformatico» de un registro generado ahora para esta empresa. */
+function sistemaInformaticoDe(empresa: Pick<Empresa, 'numeroInstalacion'>): DatosSistemaInformatico {
+  const productor = datosProductor();
+  return {
+    ...SISTEMA_INFORMATICO,
+    numeroInstalacion: empresa.numeroInstalacion,
+    productor: { nombreRazon: productor.nombreRazon, nif: productor.nif },
+    soloVerifactu: CARACTERISTICAS_SIF.soloVerifactu,
+    multiObligado: CARACTERISTICAS_SIF.multiObligado,
+    // Servicio en la nube compartido: en todo momento atiende a varios obligados.
+    multiplesObligadosAhora: CARACTERISTICAS_SIF.multiObligado,
+  };
+}
+
+/** Bloque «Encadenamiento» a partir del último registro de la cadena. */
+function encadenamientoDesde(anterior: RegistroVerifactu | null): DatosEncadenamiento {
+  if (!anterior) return { esPrimerRegistro: true, registroAnterior: null };
+  return {
+    esPrimerRegistro: false,
+    registroAnterior: {
+      idEmisorFactura: anterior.idEmisorFactura,
+      numSerieFactura: anterior.numSerieFactura,
+      fechaExpedicion: anterior.fechaExpedicion,
+      huella: anterior.huella,
+    },
+  };
+}
 
 export type ResultadoEmision = {
   factura: Factura;
@@ -108,9 +194,10 @@ export async function emitirFactura(
   ctx: ContextoUsuario,
   empresaId: unknown,
   facturaId: unknown,
-  dependencias: DependenciasEmision
+  dependencias: DependenciasEmision = {}
 ): Promise<ResultadoEmision> {
   const idFactura = validar(uuid('factura'), facturaId);
+  const serializar = dependencias.serializarRegistroAlta ?? serializarRegistroAlta;
   const entorno = entornoAeat(); // falla ANTES de abrir la transacción si falta configuración
 
   try {
@@ -178,21 +265,23 @@ export async function emitirFactura(
         entorno,
       });
 
-      const sistemaInformatico = { ...SISTEMA_INFORMATICO, numeroInstalacion: empresa.numeroInstalacion };
-      const xmlRegistro = dependencias.serializarRegistroAlta({
+      // El identificador del registro se decide aquí para que viaje dentro del
+      // propio XML («RefExterna») y permita casar la respuesta de la AEAT.
+      const registroId = randomUUID();
+      const sistemaInformatico = sistemaInformaticoDe(empresa);
+      const [desglose, relacionadas] = await Promise.all([
+        leerDesglose(tx, empresa.id, factura.id),
+        leerRelacionadas(tx, empresa.id, factura.id),
+      ]);
+      const xmlRegistro = serializar({
+        registroId,
         empresa,
         factura,
-        encadenamiento: anterior
-          ? {
-              esPrimerRegistro: false,
-              registroAnterior: {
-                idEmisorFactura: anterior.idEmisorFactura,
-                numSerieFactura: anterior.numSerieFactura,
-                fechaExpedicion: anterior.fechaExpedicion,
-                huella: anterior.huella,
-              },
-            }
-          : { esPrimerRegistro: true, registroAnterior: null },
+        desglose,
+        relacionadas,
+        esSubsanacion: false,
+        rechazoPrevio: 'N',
+        encadenamiento: encadenamientoDesde(anterior),
         sistemaInformatico,
         fechaHoraHusoGen,
         tipoHuella: TIPO_HUELLA_SHA256,
@@ -205,6 +294,7 @@ export async function emitirFactura(
 
       // (6) Inserción. El trigger vuelve a comprobar el enlace contra la cabecera.
       const registro = await insertarRegistro(tx, {
+        id: registroId,
         empresaId: empresa.id,
         facturaId: factura.id,
         tipoRegistro: 'ALTA',
@@ -252,6 +342,144 @@ export async function emitirFactura(
       facturas_emitida_completa_ck: 'La factura no se puede emitir: le faltan datos obligatorios (descripción de la operación)',
       facturas_destinatario_ck: 'Este tipo de factura exige un destinatario identificado con nombre y NIF',
     });
+  }
+}
+
+/* -------------------------------------------------------------------------- */
+/*  Anulación: factura ANULADA + registro de anulación, en una transacción    */
+/* -------------------------------------------------------------------------- */
+
+export type ResultadoAnulacion = {
+  factura: Factura;
+  registro: RegistroVerifactu;
+};
+
+/**
+ * Anula una factura EMITIDA generando su registro de facturación de anulación
+ * (art. 11 RD 1007/2023). La factura no se borra ni se modifica: pasa a
+ * ANULADA y el registro de anulación se añade a la MISMA cadena de la empresa,
+ * con su huella encadenada, igual que un registro de alta.
+ *
+ * La anulación es para facturas emitidas por error. Corregir una factura que
+ * sí documenta una operación real se hace con una factura rectificativa.
+ *
+ * Misma secuencia y mismas garantías que `emitirFactura`: cerrojo de la
+ * cadena, comprobación del último eslabón, un único instante para fechar,
+ * huella, inserción y verificación; si algo falla, no queda nada a medias.
+ */
+export async function anularFactura(
+  ctx: ContextoUsuario,
+  empresaId: unknown,
+  facturaId: unknown,
+  dependencias: DependenciasEmision = {}
+): Promise<ResultadoAnulacion> {
+  const idFactura = validar(uuid('factura'), facturaId);
+  const serializar = dependencias.serializarRegistroAnulacion ?? serializarRegistroAnulacion;
+
+  try {
+    return await db.transaction(async (tx) => {
+      const empresa = await cargarEmpresa(ctx, empresaId, tx);
+      if (empresa.modoVerifactu !== 'VERIFACTU') {
+        throw new ErrorDominio('VALIDACION', 'La anulación en modo NO VERI*FACTU todavía no está disponible');
+      }
+
+      const cabecera = await bloquearCadena(tx, empresa.id, 'FACTURACION', dependencias.esperaCerrojoMs);
+      if (!cabecera) {
+        throw new ErrorDominio('INTEGRIDAD', 'La empresa no tiene cadena de facturación', { empresaId: empresa.id });
+      }
+      const anterior = await comprobarUltimoEslabon(tx, empresa.id, cabecera);
+
+      const emitida = await buscarFacturaParaEmitir(tx, empresa.id, idFactura);
+      if (!emitida) {
+        throw new ErrorDominio('NO_ENCONTRADO', 'Factura no encontrada');
+      }
+      if (emitida.estado === 'BORRADOR') {
+        throw new ErrorDominio('CONFLICTO', 'Un borrador no se anula: se puede borrar directamente');
+      }
+      if (emitida.estado === 'ANULADA') {
+        throw new ErrorDominio('CONFLICTO', `La factura ${emitida.numSerieFactura} ya está anulada`);
+      }
+      if (!emitida.numSerieFactura || !emitida.fechaExpedicion || !emitida.emisorNif) {
+        throw new ErrorDominio('INTEGRIDAD', 'La factura emitida no tiene número, fecha o emisor', { facturaId: emitida.id });
+      }
+
+      // «SinRegistroPrevio»: la AEAT rechazó todas las altas de esta factura,
+      // así que para ella la factura que se anula no existe.
+      const altas = await estadosEnvioDeAltas(tx, empresa.id, emitida.id);
+      const sinRegistroPrevio = altas.length > 0 && altas.every((estado) => estado === 'RECHAZADO');
+
+      const ahora = await horaServidor(tx);
+      const fechaHoraHusoGen = fechaHoraHuso(ahora, empresa.husoHorario);
+      const huella = huellaRegistroAnulacion({
+        idEmisorFactura: emitida.emisorNif,
+        numSerieFactura: emitida.numSerieFactura,
+        fechaExpedicion: emitida.fechaExpedicion,
+        huellaAnterior: cabecera.ultimaHuella,
+        fechaHoraHusoGen,
+      });
+
+      const registroId = randomUUID();
+      const sistemaInformatico = sistemaInformaticoDe(empresa);
+      const xmlRegistro = serializar({
+        registroId,
+        empresa,
+        idEmisorFactura: emitida.emisorNif,
+        numSerieFactura: emitida.numSerieFactura,
+        fechaExpedicion: emitida.fechaExpedicion,
+        sinRegistroPrevio,
+        rechazoPrevio: false,
+        encadenamiento: encadenamientoDesde(anterior),
+        sistemaInformatico,
+        fechaHoraHusoGen,
+        tipoHuella: TIPO_HUELLA_SHA256,
+        huella,
+      });
+      if (typeof xmlRegistro !== 'string' || xmlRegistro.trim() === '') {
+        throw new ErrorDominio('INTEGRIDAD', 'El generador de XML no ha devuelto el registro de anulación');
+      }
+
+      const factura = await marcarAnulada(tx, empresa.id, emitida.id, ahora);
+      const registro = await insertarRegistro(tx, {
+        id: registroId,
+        empresaId: empresa.id,
+        facturaId: factura.id,
+        tipoRegistro: 'ANULACION',
+        idEmisorFactura: emitida.emisorNif,
+        nombreRazonEmisor: empresa.nombreRazon,
+        numSerieFactura: emitida.numSerieFactura,
+        fechaExpedicion: emitida.fechaExpedicion,
+        fechaHoraHusoGen,
+        esPrimerRegistro: anterior === null,
+        registroAnteriorId: cabecera.ultimoId,
+        huellaAnterior: cabecera.ultimaHuella,
+        tipoHuella: TIPO_HUELLA_SHA256,
+        huella,
+        modo: empresa.modoVerifactu,
+        sifIdSistema: sistemaInformatico.idSistema,
+        sifVersion: sistemaInformatico.version,
+        sifNumeroInstalacion: sistemaInformatico.numeroInstalacion,
+        xmlRegistro,
+        creadoPor: ctx.usuarioId,
+      });
+
+      if (
+        registro.huella !== huella ||
+        registro.numSecuencia !== cabecera.ultimoNumSecuencia + 1 ||
+        !eslabonIntegro(registro)
+      ) {
+        throw new ErrorDominio('INTEGRIDAD', 'El registro de anulación insertado no coincide con el calculado', {
+          registroId: registro.id,
+        });
+      }
+
+      await registrarActividad(tx, ctx, ActivityType.ANULAR_FACTURA, emitida.numSerieFactura);
+      return { factura, registro };
+    });
+  } catch (error) {
+    if (comoErrorPostgres(error)?.code === '55P03') {
+      throw new ErrorDominio('CONFLICTO', 'Hay otra operación en curso para esta empresa. Inténtelo de nuevo.');
+    }
+    traducirErrorBd(error);
   }
 }
 

@@ -13,6 +13,9 @@ import {
   FilePlus,
   FileText,
   FileX,
+  Ban,
+  Send,
+  Download,
   type LucideIcon,
 } from 'lucide-react';
 import { ActivityType } from '@/lib/db/schema';
@@ -33,6 +36,9 @@ const iconMap: Record<ActivityType, LucideIcon> = {
   [ActivityType.CREATE_SERIE]: FilePlus,
   [ActivityType.UPDATE_SERIE]: FileText,
   [ActivityType.DELETE_SERIE]: FileX,
+  [ActivityType.ANULAR_FACTURA]: Ban,
+  [ActivityType.REMISION_REQUERIMIENTO]: Send,
+  [ActivityType.EXPORTAR_REGISTROS]: Download,
 };
 
 function getRelativeTime(date: Date) {
@@ -79,6 +85,12 @@ function formatAction(action: ActivityType): string {
       return 'You updated an invoice series';
     case ActivityType.DELETE_SERIE:
       return 'You deleted an invoice series';
+    case ActivityType.ANULAR_FACTURA:
+      return 'You cancelled an invoice';
+    case ActivityType.REMISION_REQUERIMIENTO:
+      return 'You sent billing records to the tax agency on request';
+    case ActivityType.EXPORTAR_REGISTROS:
+      return 'You exported billing records';
     default:
       return 'Unknown action occurred';
   }

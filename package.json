@@ -10,7 +10,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:roles": "npx tsx lib/db/roles.ts",
     "db:studio": "drizzle-kit studio",
-    "test": "npx tsx --test lib/verifactu/crypto/__tests__/*.test.ts lib/verifactu/documentos/__tests__/*.test.ts",
+    "test": "npx tsx --test lib/verifactu/crypto/__tests__/*.test.ts lib/verifactu/documentos/__tests__/*.test.ts lib/verifactu/aeat/__tests__/*.test.ts",
     "test:db": "npx tsx --test lib/verifactu/__tests__/*.test.ts"
   },
   "dependencies": {
@@ -26,6 +26,7 @@
     "dotenv": "^16.5.0",
     "drizzle-kit": "^0.31.1",
     "drizzle-orm": "^0.43.1",
+    "fast-xml-parser": "^5.12.1",
     "jose": "^6.0.11",
     "lucide-react": "^0.511.0",
     "next": "15.6.0-canary.59",

@@ -38,6 +38,8 @@ type FilaPermisos = {
   escribe_cadenas: boolean;
   escribe_cola: boolean;
   mueve_contador: boolean;
+  borra_lotes: boolean;
+  escribe_control_flujo: boolean;
 };
 
 export async function diagnosticarRol(sql: postgres.Sql): Promise<DiagnosticoRol> {
@@ -83,7 +85,12 @@ export async function diagnosticarRol(sql: postgres.Sql): Promise<DiagnosticoRol
            has_table_privilege(current_user, 'empresas',            'DELETE, TRUNCATE')         AS borra_empresas,
            has_table_privilege(current_user, 'cadenas_fiscales',    'INSERT, UPDATE, DELETE, TRUNCATE') AS escribe_cadenas,
            has_table_privilege(current_user, 'envios_aeat',         'INSERT, DELETE, TRUNCATE') AS escribe_cola,
-           has_column_privilege(current_user, 'series_facturacion', 'ultimo_numero', 'UPDATE')  AS mueve_contador`;
+           has_column_privilege(current_user, 'series_facturacion', 'ultimo_numero', 'UPDATE')  AS mueve_contador,
+           -- Tablas de la remisión a la AEAT (Fase 4); se ignoran si aún no están migradas.
+           CASE WHEN to_regclass('public.aeat_lotes') IS NULL THEN false
+                ELSE has_table_privilege(current_user, 'aeat_lotes', 'DELETE, TRUNCATE') END     AS borra_lotes,
+           CASE WHEN to_regclass('public.aeat_control_flujo') IS NULL THEN false
+                ELSE has_table_privilege(current_user, 'aeat_control_flujo', 'INSERT, DELETE, TRUNCATE') END AS escribe_control_flujo`;
 
   if (p.modifica_registros) problemas.push('puede modificar o borrar registros_verifactu');
   if (p.modifica_eventos) problemas.push('puede modificar o borrar eventos_log');
@@ -92,6 +99,8 @@ export async function diagnosticarRol(sql: postgres.Sql): Promise<DiagnosticoRol
   if (p.escribe_cadenas) problemas.push('puede escribir directamente en cadenas_fiscales');
   if (p.escribe_cola) problemas.push('puede insertar o borrar en envios_aeat');
   if (p.mueve_contador) problemas.push('puede mover el contador de las series');
+  if (p.borra_lotes) problemas.push('puede borrar la evidencia de los envíos (aeat_lotes)');
+  if (p.escribe_control_flujo) problemas.push('puede insertar o borrar en aeat_control_flujo');
 
   return { rol: f.rol, problemas };
 }

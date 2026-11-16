@@ -1,9 +1,15 @@
 import { and, asc, eq, sql } from 'drizzle-orm';
 import type { DbOrTx, Transaction } from '@/lib/db/drizzle';
 import {
+  enviosAeat,
   facturas,
+  facturasDesglose,
+  facturasRelacionadas,
   registrosVerifactu,
+  type EnvioAeat,
   type Factura,
+  type FacturaDesglose,
+  type FacturaRelacionada,
   type NewRegistroVerifactu,
   type RegistroVerifactu,
 } from '@/lib/db/schema';
@@ -115,6 +121,68 @@ export async function marcarEmitida(
     .where(and(eq(facturas.empresaId, empresaId), eq(facturas.id, facturaId)))
     .returning();
   return emitida;
+}
+
+/** Paso EMITIDA → ANULADA. El resto de la factura sigue congelado (trigger). */
+export async function marcarAnulada(
+  tx: Transaction,
+  empresaId: string,
+  facturaId: string,
+  instante: Date
+): Promise<Factura> {
+  const [anulada] = await tx
+    .update(facturas)
+    .set({ estado: 'ANULADA', anuladaEn: instante })
+    .where(and(eq(facturas.empresaId, empresaId), eq(facturas.id, facturaId)))
+    .returning();
+  return anulada;
+}
+
+/** Bloque «Desglose» congelado con la factura, en orden estable. */
+export async function leerDesglose(dbx: DbOrTx, empresaId: string, facturaId: string): Promise<FacturaDesglose[]> {
+  return dbx
+    .select()
+    .from(facturasDesglose)
+    .where(and(eq(facturasDesglose.empresaId, empresaId), eq(facturasDesglose.facturaId, facturaId)))
+    .orderBy(
+      asc(facturasDesglose.impuesto),
+      asc(facturasDesglose.claveRegimen),
+      sql`${facturasDesglose.tipoImpositivo} DESC NULLS LAST`,
+      asc(facturasDesglose.id)
+    );
+}
+
+/** Facturas rectificadas o sustituidas por esta. */
+export async function leerRelacionadas(
+  dbx: DbOrTx,
+  empresaId: string,
+  facturaId: string
+): Promise<FacturaRelacionada[]> {
+  return dbx
+    .select()
+    .from(facturasRelacionadas)
+    .where(and(eq(facturasRelacionadas.empresaId, empresaId), eq(facturasRelacionadas.facturaId, facturaId)))
+    .orderBy(asc(facturasRelacionadas.referidaFechaExpedicion), asc(facturasRelacionadas.referidaNumSerie));
+}
+
+/** Estado de remisión de cada registro de ALTA de una factura. */
+export async function estadosEnvioDeAltas(
+  dbx: DbOrTx,
+  empresaId: string,
+  facturaId: string
+): Promise<EnvioAeat['estado'][]> {
+  const filas = await dbx
+    .select({ estado: enviosAeat.estado })
+    .from(registrosVerifactu)
+    .innerJoin(enviosAeat, eq(enviosAeat.registroId, registrosVerifactu.id))
+    .where(
+      and(
+        eq(registrosVerifactu.empresaId, empresaId),
+        eq(registrosVerifactu.facturaId, facturaId),
+        eq(registrosVerifactu.tipoRegistro, 'ALTA')
+      )
+    );
+  return filas.map((f) => f.estado);
 }
 
 export async function buscarRegistro(

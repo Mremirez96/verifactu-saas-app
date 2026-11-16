@@ -10,6 +10,7 @@
  *          ├─ series_facturacion
  *          ├─ facturas ─ facturas_lineas / facturas_desglose / facturas_relacionadas
  *          ├─ registros_verifactu ─ envios_aeat        (cadena de registros de facturación)
+ *          ├─ aeat_lotes / aeat_control_flujo           (remisión a la AEAT: mensajes y control de flujo)
  *          ├─ eventos_log                              (cadena de registros de evento)
  *          └─ cadenas_fiscales                         (cabecera de cada cadena)
  *
@@ -24,6 +25,8 @@
  *                                        sin saltos y validación del encadenamiento.
  *   · `0003_verifactu_privilegios.sql` → rol de aplicación con privilegios
  *                                        acotados (ver lib/db/README.md).
+ *   · `0005_aeat_remision_guardas.sql` → permisos y guardas de la remisión a
+ *                                        la AEAT (Fase 4).
  */
 import {
   pgTable,
@@ -181,6 +184,22 @@ export const estadoEnvioEnum = pgEnum('estado_envio_aeat', [
   'ACEPTADO_CON_ERRORES', // admitido; requiere registro de subsanación
   'RECHAZADO', // "Incorrecto"; requiere nuevo registro con RechazoPrevio
   'ERROR_TRANSITORIO', // fallo técnico (red, 5xx, timeout): se reintenta
+]);
+
+/** Servicio de la AEAT al que se dirige un mensaje de remisión. */
+export const tipoRemisionEnum = pgEnum('tipo_remision_aeat', [
+  'VOLUNTARIA', // «VERI*FACTU»: remisión automática (art. 16 Orden HAC/1177/2024)
+  'REQUERIMIENTO', // respuesta a un requerimiento (art. 14.2 RD 1007/2023, art. 18 Orden)
+]);
+
+/** Desenlace de un mensaje (lote) enviado a la AEAT. */
+export const resultadoLoteEnum = pgEnum('resultado_lote_aeat', [
+  'EN_CURSO', // enviado, sin desenlace todavía
+  'CORRECTO', // «EstadoEnvio» = Correcto
+  'PARCIALMENTE_CORRECTO', // «EstadoEnvio» = ParcialmenteCorrecto
+  'INCORRECTO', // «EstadoEnvio» = Incorrecto: todos los registros rechazados
+  'RECHAZADO', // envío completo rechazado (SOAP Fault de cliente, HTTP 4xx)
+  'ERROR_TRANSITORIO', // sin respuesta útil: red, timeout, 5xx, Fault de servidor
 ]);
 
 /* ========================================================================== */
@@ -933,6 +952,12 @@ export const enviosAeat = pgTable(
     codigoError: varchar('codigo_error', { length: 10 }),
     descripcionError: text('descripcion_error'),
     respuestaAeat: jsonb('respuesta_aeat'),
+    /**
+     * TRUE mientras exista un intento del que no se sabe si la AEAT llegó a
+     * procesarlo (timeout, conexión cortada tras enviar, proceso interrumpido).
+     * Permite conciliar el reenvío cuando la AEAT responde «registro duplicado».
+     */
+    entregaIncierta: boolean('entrega_incierta').notNull().default(false),
 
     updatedAt: timestamp('updated_at', { withTimezone: true })
       .notNull()
@@ -950,6 +975,122 @@ export const enviosAeat = pgTable(
       .where(sql`${t.estado} IN ('PENDIENTE','ERROR_TRANSITORIO')`),
     index('envios_aeat_empresa_estado_idx').on(t.empresaId, t.estado),
     index('envios_aeat_lote_idx').on(t.loteId),
+  ]
+);
+
+/* ========================================================================== */
+/*  10 bis. REMISIÓN A LA AEAT: MENSAJES Y CONTROL DE FLUJO (Fase 4)          */
+/* ========================================================================== */
+
+/**
+ * Un mensaje SOAP enviado a la AEAT (de 1 a 1.000 registros de una empresa).
+ *
+ * Es la EVIDENCIA de cada intento: qué se envió, cuándo, a qué servicio y qué
+ * contestó la AEAT (incluido el XML de la respuesta con el CSV). El artículo
+ * 16.4 de la Orden obliga a poder justificar las incidencias de remisión; con
+ * esta tabla cada reintento queda documentado. `envios_aeat` guarda solo el
+ * estado vigente de cada registro; el historial está aquí.
+ *
+ * La fila se inserta EN_CURSO antes de salir a la red y se cierra una sola
+ * vez: un lote cerrado ya no se modifica (trigger de 0005).
+ */
+export const aeatLotes = pgTable(
+  'aeat_lotes',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    empresaId: uuid('empresa_id')
+      .notNull()
+      .references(() => empresas.id),
+    tipoRemision: tipoRemisionEnum('tipo_remision').notNull().default('VOLUNTARIA'),
+    /** pruebas | produccion */
+    entorno: varchar('entorno', { length: 10 }).notNull(),
+    endpoint: text('endpoint').notNull(),
+    /** «RefRequerimiento»: solo en remisiones por requerimiento. */
+    refRequerimiento: varchar('ref_requerimiento', { length: 18 }),
+    /** «Incidencia» = S en la cabecera del mensaje (art. 16.4 Orden). */
+    incidencia: boolean('incidencia').notNull().default(false),
+
+    numRegistros: integer('num_registros').notNull(),
+    primerNumSecuencia: bigint('primer_num_secuencia', { mode: 'number' }).notNull(),
+    ultimoNumSecuencia: bigint('ultimo_num_secuencia', { mode: 'number' }).notNull(),
+    /** SHA-256 del mensaje enviado (el contenido se reconstruye desde los registros). */
+    peticionSha256: varchar('peticion_sha256', { length: 64 }).notNull(),
+
+    resultado: resultadoLoteEnum('resultado').notNull().default('EN_CURSO'),
+    estadoHttp: integer('estado_http'),
+    /** Código Seguro de Verificación del envío (acuse de recibo). */
+    csv: varchar('csv', { length: 50 }),
+    /** «TiempoEsperaEnvio» devuelto por la AEAT, en segundos. */
+    tiempoEsperaSeg: integer('tiempo_espera_seg'),
+    codigoError: varchar('codigo_error', { length: 20 }),
+    descripcionError: text('descripcion_error'),
+    /** Respuesta íntegra de la AEAT (sobre SOAP), tal como llegó. */
+    respuestaXml: text('respuesta_xml'),
+    /** Resultado por registro; solo en remisiones por requerimiento. */
+    resultadoRegistros: jsonb('resultado_registros'),
+
+    iniciadoEn: timestamp('iniciado_en', { withTimezone: true }).notNull().defaultNow(),
+    finalizadoEn: timestamp('finalizado_en', { withTimezone: true }),
+  },
+  (t) => [
+    unique('aeat_lotes_empresa_id_uq').on(t.empresaId, t.id),
+    index('aeat_lotes_empresa_idx').on(t.empresaId, t.iniciadoEn),
+    check('aeat_lotes_num_registros_ck', sql`${t.numRegistros} BETWEEN 1 AND 1000`),
+    check('aeat_lotes_entorno_ck', sql`${t.entorno} IN ('pruebas','produccion')`),
+    check(
+      'aeat_lotes_requerimiento_ck',
+      sql`(${t.tipoRemision} = 'REQUERIMIENTO') = (${t.refRequerimiento} IS NOT NULL)`
+    ),
+    check(
+      'aeat_lotes_cierre_ck',
+      sql`(${t.resultado} = 'EN_CURSO') = (${t.finalizadoEn} IS NULL)`
+    ),
+  ]
+);
+
+/**
+ * Estado de la remisión voluntaria de UNA empresa: control de flujo, reintentos
+ * e incidencia. Una fila por empresa; la crea un trigger al nacer la empresa.
+ *
+ * Es también el cerrojo que serializa los envíos de una empresa (se toma con
+ * FOR UPDATE SKIP LOCKED): los registros de un obligado tienen que llegar a la
+ * AEAT en el orden en que se generaron, así que nunca hay dos mensajes de la
+ * misma empresa en vuelo a la vez.
+ */
+export const aeatControlFlujo = pgTable(
+  'aeat_control_flujo',
+  {
+    empresaId: uuid('empresa_id')
+      .primaryKey()
+      .references(() => empresas.id),
+    /** «t»: espera mínima entre envíos. 60 s hasta que la AEAT diga otra cosa. */
+    tiempoEsperaSeg: integer('tiempo_espera_seg').notNull().default(60),
+    ultimoEnvioEn: timestamp('ultimo_envio_en', { withTimezone: true }),
+    /** No se envía antes de este instante (control de flujo o espera de reintento). */
+    proximoEnvioEn: timestamp('proximo_envio_en', { withTimezone: true })
+      .notNull()
+      .defaultNow(),
+    /** Fallos técnicos seguidos: es el exponente de la espera exponencial. */
+    fallosConsecutivos: integer('fallos_consecutivos').notNull().default(0),
+    /** Inicio de la incidencia abierta; NULL = remisión al día. */
+    incidenciaDesde: timestamp('incidencia_desde', { withTimezone: true }),
+    ultimoErrorCodigo: varchar('ultimo_error_codigo', { length: 20 }),
+    ultimoError: text('ultimo_error'),
+    /** TRUE = la AEAT rechaza el envío completo y hace falta intervención. */
+    requiereIntervencion: boolean('requiere_intervencion').notNull().default(false),
+    /** Arrendamiento del mensaje en vuelo (ver remision.ts). */
+    loteEnCursoId: uuid('lote_en_curso_id'),
+    loteEnCursoCaducaEn: timestamp('lote_en_curso_caduca_en', { withTimezone: true }),
+    updatedAt: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index('aeat_control_flujo_proximo_idx').on(t.proximoEnvioEn),
+    check('aeat_control_flujo_espera_ck', sql`${t.tiempoEsperaSeg} BETWEEN 0 AND 9999`),
+    check('aeat_control_flujo_fallos_ck', sql`${t.fallosConsecutivos} >= 0`),
+    check(
+      'aeat_control_flujo_arrendamiento_ck',
+      sql`(${t.loteEnCursoId} IS NULL) = (${t.loteEnCursoCaducaEn} IS NULL)`
+    ),
   ]
 );
 
@@ -1265,6 +1406,9 @@ export type CadenaFiscal = typeof cadenasFiscales.$inferSelect;
 export type RegistroVerifactu = typeof registrosVerifactu.$inferSelect;
 export type NewRegistroVerifactu = typeof registrosVerifactu.$inferInsert;
 export type EnvioAeat = typeof enviosAeat.$inferSelect;
+export type AeatLote = typeof aeatLotes.$inferSelect;
+export type NewAeatLote = typeof aeatLotes.$inferInsert;
+export type AeatControlFlujo = typeof aeatControlFlujo.$inferSelect;
 export type EventoLog = typeof eventosLog.$inferSelect;
 export type NewEventoLog = typeof eventosLog.$inferInsert;
 
@@ -1284,4 +1428,7 @@ export enum ActivityType {
   CREATE_SERIE = 'CREATE_SERIE',
   UPDATE_SERIE = 'UPDATE_SERIE',
   DELETE_SERIE = 'DELETE_SERIE',
+  ANULAR_FACTURA = 'ANULAR_FACTURA',
+  REMISION_REQUERIMIENTO = 'REMISION_REQUERIMIENTO',
+  EXPORTAR_REGISTROS = 'EXPORTAR_REGISTROS',
 }
