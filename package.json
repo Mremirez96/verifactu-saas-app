@@ -8,7 +8,9 @@
     "db:seed": "npx tsx lib/db/seed.ts",
     "db:generate": "drizzle-kit generate",
     "db:migrate": "drizzle-kit migrate",
-    "db:studio": "drizzle-kit studio"
+    "db:roles": "npx tsx lib/db/roles.ts",
+    "db:studio": "drizzle-kit studio",
+    "test:db": "npx tsx --test lib/verifactu/__tests__/*.test.ts"
   },
   "dependencies": {
     "@tailwindcss/postcss": "4.1.7",

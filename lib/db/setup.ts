@@ -77,8 +77,18 @@ async function checkStripeCLI() {
   }
 }
 
-async function getPostgresURL(): Promise<string> {
+type PostgresURLs = {
+  /** Rol de la aplicación (privilegios acotados). */
+  POSTGRES_URL: string;
+  /** Rol propietario del esquema (solo migraciones). */
+  POSTGRES_MIGRATION_URL: string;
+};
+
+async function getPostgresURLs(): Promise<PostgresURLs> {
   console.log('Step 2: Setting up Postgres');
+  console.log(
+    'The app uses TWO database users: an owner for migrations and a restricted one for the app (see lib/db/README.md).'
+  );
   const dbChoice = await question(
     'Do you want to use a local Postgres instance with Docker (L) or a remote Postgres instance (R)? (L/R): '
   );
@@ -86,12 +96,25 @@ async function getPostgresURL(): Promise<string> {
   if (dbChoice.toLowerCase() === 'l') {
     console.log('Setting up local Postgres instance with Docker...');
     await setupLocalPostgres();
-    return 'postgres://postgres:postgres@localhost:54322/postgres';
+    // La contraseña del usuario de la app se genera aquí y `pnpm db:roles`
+    // creará ese usuario con ella.
+    const appPassword = crypto.randomBytes(18).toString('hex');
+    return {
+      POSTGRES_MIGRATION_URL:
+        'postgres://postgres:postgres@localhost:54322/postgres',
+      POSTGRES_URL: `postgres://verifactu_app_login:${appPassword}@localhost:54322/postgres`,
+    };
   } else {
     console.log(
       'You can find Postgres databases at: https://vercel.com/marketplace?category=databases'
     );
-    return await question('Enter your POSTGRES_URL: ');
+    const POSTGRES_MIGRATION_URL = await question(
+      'Enter your POSTGRES_MIGRATION_URL (schema OWNER, used only for migrations): '
+    );
+    const POSTGRES_URL = await question(
+      'Enter your POSTGRES_URL (restricted APP user; `pnpm db:roles` will create it with this user/password): '
+    );
+    return { POSTGRES_URL, POSTGRES_MIGRATION_URL };
   }
 }
 
@@ -196,7 +219,7 @@ async function writeEnvFile(envVars: Record<string, string>) {
 async function main() {
   await checkStripeCLI();
 
-  const POSTGRES_URL = await getPostgresURL();
+  const { POSTGRES_URL, POSTGRES_MIGRATION_URL } = await getPostgresURLs();
   const STRIPE_SECRET_KEY = await getStripeSecretKey();
   const STRIPE_WEBHOOK_SECRET = await createStripeWebhook();
   const BASE_URL = 'http://localhost:3000';
@@ -204,6 +227,7 @@ async function main() {
 
   await writeEnvFile({
     POSTGRES_URL,
+    POSTGRES_MIGRATION_URL,
     STRIPE_SECRET_KEY,
     STRIPE_WEBHOOK_SECRET,
     BASE_URL,
@@ -211,6 +235,9 @@ async function main() {
   });
 
   console.log('🎉 Setup completed successfully!');
+  console.log(
+    'Next: pnpm db:migrate  →  pnpm db:roles  →  pnpm db:seed'
+  );
 }
 
 main().catch(console.error);

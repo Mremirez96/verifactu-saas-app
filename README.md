@@ -46,12 +46,15 @@ Use the included setup script to create your `.env` file:
 pnpm db:setup
 ```
 
-Run the database migrations and seed the database with a default user and team:
+Run the database migrations, create the restricted database user the app connects with, and seed the database with a default user and team:
 
 ```bash
-pnpm db:migrate
+pnpm db:migrate   # runs as the schema OWNER (POSTGRES_MIGRATION_URL)
+pnpm db:roles     # creates the APP user from POSTGRES_URL (restricted privileges)
 pnpm db:seed
 ```
+
+The app and the migrations use **different database credentials** so that the VERI*FACTU integrity triggers cannot be bypassed by the application. See [`lib/db/README.md`](lib/db/README.md).
 
 This will create the following user and team:
 
