@@ -10,6 +10,7 @@
     "db:migrate": "drizzle-kit migrate",
     "db:roles": "npx tsx lib/db/roles.ts",
     "db:studio": "drizzle-kit studio",
+    "test": "npx tsx --test lib/verifactu/crypto/__tests__/*.test.ts",
     "test:db": "npx tsx --test lib/verifactu/__tests__/*.test.ts"
   },
   "dependencies": {
